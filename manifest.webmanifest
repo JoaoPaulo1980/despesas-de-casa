@@ -3,7 +3,7 @@
   "short_name": "Despesas",
   "description": "Controle das despesas da casa e das próximas contas.",
   "lang": "pt-BR",
-  "start_url": "./",
+  "start_url": "./?app=2",
   "scope": "./",
   "display": "standalone",
   "background_color": "#f6f8fc",
