@@ -1,9 +1,11 @@
 import * as L from './logic.js';
 import { uid } from './demo.js';
 import * as store from './store.js';
+import * as cloud from './cloud.js';
+import { merge } from './sync.js';
 import { icon, houseSolid } from './icons.js';
 
-let st = store.load();
+let st = store.load(); // null = celular ligado à nuvem que perdeu a cópia local: busca antes de mostrar qualquer coisa
 const ui = { month: L.monthOf(L.todayISO()), open: new Set() };
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -24,8 +26,45 @@ const NAV = [
   ['config', 'Configurações', 'Config.', 'gear'],
 ];
 
+const sync = { state: store.getLink() ? 'idle' : 'off', syncing: false, timer: 0, error: null };
 function persist() {
   if (!store.save(st)) toast('Não consegui salvar neste navegador (modo privado?).');
+  if (store.getLink()) scheduleSync(900);
+}
+function scheduleSync(ms) { clearTimeout(sync.timer); sync.timer = setTimeout(runSync, ms); }
+async function runSync() {
+  if (!store.getLink() || sync.syncing || !st) return;
+  sync.syncing = true; sync.state = 'syncing'; renderSyncbar();
+  try {
+    const sent = JSON.stringify(st);
+    const r = await cloud.syncNow(st);
+    // se o usuário mexeu durante a espera, junta de novo com o que está na tela agora
+    st = JSON.stringify(st) === sent ? r.state : merge(st, r.state);
+    store.save(st);
+    sync.state = 'ok'; sync.error = null;
+    if (JSON.stringify(st) !== sent && $('#modal').hidden && !document.activeElement?.matches?.('input,select,textarea')) render();
+    if (JSON.stringify(st) !== JSON.stringify(r.state)) scheduleSync(500);
+  } catch (e) {
+    sync.state = e.kind === 'codigo' ? 'codigo' : e.kind === 'offline' ? 'offline' : 'fora';
+    sync.error = e;
+  } finally { sync.syncing = false; renderSyncbar(); }
+}
+const hhmm = (t) => { const d = new Date(t); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+function renderSyncbar() {
+  const el = $('#syncbar'); if (!el) return;
+  const l = store.getLink();
+  if (!l) { el.innerHTML = ''; el.className = 'syncbar'; return; }
+  const ult = l.lastOk ? `sincronizados pela última vez em ${new Date(l.lastOk).toLocaleDateString('pt-BR')} às ${hhmm(l.lastOk)}` : 'ainda não sincronizados';
+  const M = {
+    ok: ['ok', `Compartilhado com a casa · sincronizado às ${hhmm(l.lastOk || Date.now())}`],
+    idle: ['ok', 'Compartilhado com a casa'],
+    syncing: ['ok', 'Sincronizando…'],
+    offline: ['bad', `<b>Sem conexão com o serviço online.</b> Você está vendo os dados salvos neste celular (${ult}). O que você lançar fica guardado aqui e é enviado quando a conexão voltar. O outro celular só vê as mudanças depois disso.`],
+    fora: ['bad', `<b>O serviço online não está respondendo.</b> Você está vendo os dados salvos neste celular (${ult}). O que você lançar fica guardado aqui e é enviado quando o serviço voltar.`],
+    codigo: ['bad', '<b>O código da casa não foi aceito pelo servidor.</b> Os dados deste celular estão salvos, mas não estão sendo compartilhados. Vá em Configurações e entre de novo com o código.'],
+  }[sync.state] || ['ok', ''];
+  el.className = 'syncbar ' + M[0];
+  el.innerHTML = `<span>${M[1]}</span>${M[0] === 'bad' ? '<button class="btn sm ghost" data-act="sync-now">Tentar de novo</button>' : ''}`;
 }
 let toastT;
 function toast(msg) {
@@ -181,6 +220,18 @@ function viewRelatorio() {
   </div>`;
 }
 
+function shareSection() {
+  const l = store.getLink();
+  if (!cloud.enabled()) return '';
+  if (!l) return `<section class="card"><h2 style="margin-bottom:8px">Compartilhar com a casa</h2>
+    <p class="muted" style="margin-bottom:12px">Para você e sua família verem as mesmas contas em celulares diferentes, sem lançar duas vezes. Os dados passam a ficar também num serviço online, protegidos por um <b>código da casa</b>.</p>
+    <div class="flex"><button class="btn" data-act="cloud-create">Criar a casa com os dados deste celular</button><button class="btn ghost" data-act="cloud-join">Já tenho o código</button></div></section>`;
+  const msg = { ok: 'Sincronizado', idle: 'Compartilhado', syncing: 'Sincronizando…', offline: 'Sem conexão', fora: 'Serviço fora do ar', codigo: 'Código recusado' }[sync.state] || '';
+  return `<section class="card"><h2 style="margin-bottom:8px">Compartilhar com a casa</h2>
+    <p class="muted" style="margin-bottom:12px">Este celular está ligado à casa. ${msg}${l.lastOk ? ` · última vez às ${hhmm(l.lastOk)}` : ''}.</p>
+    <div class="flex"><button class="btn ghost" data-act="sync-now">Sincronizar agora</button><button class="btn ghost" data-act="cloud-show">Mostrar o código</button><button class="btn danger" data-act="cloud-unlink">Desligar neste celular</button></div></section>`;
+}
+
 function viewConfig() {
   const cats = st.categories.map((c) => `<div class="setrow">${catIco(c)}<div style="flex:1;font-weight:700">${esc(c.name)}</div>
     <button class="iconbtn" data-act="ren-cat" data-id="${c.id}" aria-label="Renomear ${esc(c.name)}">${icon('edit')}</button>
@@ -189,15 +240,16 @@ function viewConfig() {
   <div class="cards">
     <section class="card"><h2 style="margin-bottom:12px">Geral</h2>
       <form id="cfg"><div class="two"><div class="field"><label for="c-res">Número de moradores</label><input id="c-res" name="res" inputmode="numeric" value="${st.settings.residents || ''}" placeholder="Ex.: 7"></div>
-      <div class="field"><label for="c-av">Disponível hoje (£)</label><input id="c-av" name="av" inputmode="decimal" value="${st.settings.available ? (st.settings.available / 100).toFixed(2).replace(/\.00$/, '') : ''}" placeholder="0"></div></div>
+      <div class="field"><label for="c-av">Disponível hoje (£)</label><input id="c-av" name="av" inputmode="decimal" value="${L.availableNow(st) ? (L.availableNow(st) / 100).toFixed(2).replace(/\.00$/, '') : ''}" placeholder="0"></div></div>
       <div class="field"><label>Moeda</label><input value="GBP (£)" disabled></div><button class="btn">Salvar</button></form></section>
+    ${shareSection()}
     <section class="card"><div class="sechead"><h2>Categorias</h2><button class="btn ghost sm" data-act="add-cat">${icon('plus')}Nova categoria</button></div>${cats}
       <p class="note">Ao excluir uma categoria, o que era dela passa para “Outros”.</p></section>
     <section class="card"><h2 style="margin-bottom:8px">Seus dados</h2>
-      <div class="warn" style="margin-bottom:14px"><b>Onde ficam os dados:</b> só neste navegador, neste aparelho. O que você lança no computador <b>não aparece no celular</b>, e <b>limpar os dados do navegador apaga tudo</b>. Use “Exportar” de vez em quando para guardar uma cópia.</div>
-      <div class="flex"><button class="btn ghost" data-act="export">${icon('download')}Exportar cópia</button><button class="btn ghost" data-act="import">${icon('upload')}Importar cópia</button></div>
+      <div class="warn" style="margin-bottom:14px">${store.getLink() ? '<b>Onde ficam os dados:</b> neste celular e também no serviço online da casa. Quem tem o código vê e altera tudo. Limpar o navegador não perde nada, porque dá para entrar de novo com o código.' : '<b>Onde ficam os dados:</b> só neste navegador, neste aparelho. O que você lança no computador <b>não aparece no celular</b>, e <b>limpar os dados do navegador apaga tudo</b>. Use “Exportar” de vez em quando para guardar uma cópia.'}</div>
+      <div class="flex"><button class="btn ghost" data-act="export">${icon('download')}Exportar cópia</button>${store.getLink() ? '' : `<button class="btn ghost" data-act="import">${icon('upload')}Importar cópia</button>`}</div>
       <hr style="border:0;border-top:1px solid var(--line);margin:18px 0">
-      <div class="flex"><button class="btn ghost" data-act="reset-demo">Restaurar demonstração</button><button class="btn danger" data-act="reset-empty">Apagar tudo e começar do zero</button></div></section>
+      <div class="flex">${store.getLink() ? '' : '<button class="btn ghost" data-act="reset-demo">Restaurar demonstração</button>'}<button class="btn danger" data-act="reset-empty">Apagar tudo e começar do zero</button></div></section>
   </div>`;
 }
 
@@ -248,7 +300,7 @@ function expenseForm(id, again) {
     if (!(amount > 0)) return 'Informe um valor maior que zero.';
     if (!d.desc.trim()) return 'Informe a descrição.';
     if (!/^\d{4}-\d{2}-\d{2}$/.test(d.date)) return 'Informe a data.';
-    const rec = { id: e?.id || uid('e'), date: d.date, desc: d.desc.trim(), cat: d.cat, amount, note: d.note.trim() };
+    const rec = { id: e?.id || uid('e'), date: d.date, desc: d.desc.trim(), cat: d.cat, amount, note: d.note.trim(), u: Date.now() };
     if (e) Object.assign(e, rec); else st.expenses.push(rec);
     persist(); closeModal();
     if (!e) ui.month = L.monthOf(d.date) === ui.month ? ui.month : ui.month;
@@ -275,7 +327,7 @@ function recurringForm(id) {
     if (!d.name.trim()) return 'Informe o nome.';
     if (!(amount > 0)) return 'Informe um valor maior que zero.';
     if (!/^\d{4}-\d{2}-\d{2}$/.test(d.start)) return 'Informe a data da primeira cobrança.';
-    const rec = { id: r?.id || uid('r'), name: d.name.trim(), cat: d.cat, amount, freq: d.freq, start: d.start, account: d.account.trim(), note: d.note.trim(), active: !!d._active };
+    const rec = { id: r?.id || uid('r'), name: d.name.trim(), cat: d.cat, amount, freq: d.freq, start: d.start, account: d.account.trim(), note: d.note.trim(), active: !!d._active, u: Date.now() };
     if (r) Object.assign(r, rec); else st.recurring.push(rec);
     persist(); closeModal(); render(); toast(r ? 'Recorrente atualizada.' : 'Recorrente cadastrada. As próximas cobranças já foram calculadas.');
   });
@@ -293,18 +345,49 @@ function nameForm(title, current, cb) {
 function editAvailable() {
   const el = $('#avail');
   if (!el || el.querySelector('input')) return;
-  el.innerHTML = `<span class="lbl">${icon('wallet')}Disponível hoje (£)</span><input inputmode="decimal" aria-label="Disponível hoje" value="${st.settings.available ? (st.settings.available / 100).toFixed(2).replace(/\.00$/, '') : ''}" placeholder="0"><span class="sub">Enter para salvar</span>`;
+  el.innerHTML = `<span class="lbl">${icon('wallet')}Disponível hoje (£)</span><input inputmode="decimal" aria-label="Disponível hoje" value="${L.availableNow(st) ? (L.availableNow(st) / 100).toFixed(2).replace(/\.00$/, '') : ''}" placeholder="0"><span class="sub">Enter para salvar</span>`;
   const inp = el.querySelector('input');
   inp.focus(); inp.select();
   let done = false;
   const commit = () => {
     if (done) return; done = true;
     const v = inp.value.trim() === '' ? 0 : parseSigned(inp.value);
-    if (Number.isNaN(v)) { toast('Valor inválido.'); } else { st.settings.available = v; persist(); }
+    if (Number.isNaN(v)) { toast('Valor inválido.'); } else { if (v !== L.availableNow(st)) L.setAvailable(st, v); persist(); }
     render();
   };
   inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') { done = true; render(); } });
   inp.addEventListener('blur', commit);
+}
+
+// ---------- nuvem: criar / entrar ----------
+const errText = (e) => ({ offline: 'Sem conexão com o serviço online. Tente de novo quando a internet voltar.', fora: 'O serviço online não está respondendo agora. Nada foi alterado. Tente mais tarde.', codigo: 'Código não reconhecido. Confira as letras e números.', ja_existe: 'Já existe uma casa criada. Use “Já tenho o código” neste celular.', invalido: 'Não foi possível criar a casa.' }[e.kind] || 'Algo deu errado. Nada foi alterado.');
+function showCode(code, first) {
+  openForm('Código da casa', `<p style="margin-bottom:10px">${first ? '<b>A casa foi criada.</b> ' : ''}Este é o código. Quem tiver o código <b>vê e altera todas as contas</b>; sem ele, ninguém entra.</p>
+    <div style="font-size:26px;font-weight:800;letter-spacing:.04em;text-align:center;padding:16px;background:#eaf0f9;border-radius:14px;margin-bottom:12px;user-select:all">${cloud.prettyCode(code)}</div>
+    <p class="note" style="margin:0 0 10px">${first ? 'Anote agora (Notas, gerenciador de senhas). No celular da sua esposa: abra o mesmo link, vá em Configurações → “Já tenho o código” e digite estes caracteres.' : 'No outro celular: Configurações → “Já tenho o código”.'}</p>`,
+  () => { closeModal(); render(); }, { submitLabel: 'Entendi' });
+  $('#modal .btn.ghost[data-act=close]')?.remove();
+}
+function cloudCreate() {
+  const demoWarn = st.demo ? '\n\nAtenção: estes ainda são os dados de DEMONSTRAÇÃO. Se você quer começar do zero, cancele e use antes “Apagar tudo e começar do zero”.' : '';
+  if (!confirm('Criar a casa na nuvem com os dados deste celular?\nUma cópia de segurança fica guardada neste celular antes.' + demoWarn)) return;
+  store.backup();
+  toast('Criando a casa…');
+  cloud.createHouse(st).then((code) => { sync.state = 'ok'; renderSyncbar(); showCode(code, true); render(); })
+    .catch((e) => toast(errText(e)));
+}
+function cloudJoin() {
+  openForm('Entrar na casa', `<p class="note" style="margin:0 0 12px">Os dados que estão neste celular serão <b>substituídos</b> pelos da casa. (Uma cópia de segurança fica guardada aqui.)</p>
+    <div class="field"><label for="j-code">Código da casa</label><input id="j-code" name="code" autocomplete="off" autocapitalize="characters" placeholder="XXXX-XXXX-XXXX-XXXX" style="text-transform:uppercase"></div>`,
+  (d) => {
+    const code = cloud.normalizeCode(d.code);
+    if (code.length < 16) return 'O código tem 16 letras e números.';
+    $('#ferr').hidden = true;
+    cloud.fetchHouse(code).then((h) => {
+      store.backup(); st = h.state; store.setLink({ code: h.code, version: h.version, lastOk: Date.now() }); store.save(st);
+      sync.state = 'ok'; closeModal(); renderSyncbar(); render(); toast('Entrou na casa. Dados carregados.');
+    }).catch((e) => { const el = $('#ferr'); el.textContent = errText(e); el.hidden = false; });
+  }, { submitLabel: 'Entrar' });
 }
 
 // ---------- cliques ----------
@@ -321,20 +404,25 @@ document.addEventListener('click', (ev) => {
     case 'unpay': L.unmarkPaid(st, b.dataset.rec, b.dataset.date); persist(); render(); return toast('Pagamento desfeito — valor devolvido ao disponível.');
     case 'new-exp': return expenseForm();
     case 'edit-exp': return expenseForm(id);
-    case 'del-exp': { const e = st.expenses.find((x) => x.id === id); if (e && confirm(`Excluir “${e.desc}” (${money(e.amount)})?`)) { st.expenses = st.expenses.filter((x) => x.id !== id); persist(); render(); toast('Despesa excluída.'); } return; }
+    case 'del-exp': { const e = st.expenses.find((x) => x.id === id); if (e && confirm(`Excluir “${e.desc}” (${money(e.amount)})?`)) { L.removeRec(st, 'expenses', id); persist(); render(); toast('Despesa excluída.'); } return; }
     case 'new-rec': return recurringForm();
     case 'edit-rec': return recurringForm(id);
-    case 'toggle-rec': { const r = st.recurring.find((x) => x.id === id); r.active = !r.active; persist(); render(); return toast(r.active ? 'Recorrente ativada.' : 'Recorrente pausada.'); }
-    case 'del-rec': { const r = st.recurring.find((x) => x.id === id); if (confirm(`Excluir a recorrente “${r.name}”?\nO que já foi pago continua nos relatórios; as cobranças futuras somem.`)) { st.recurring = st.recurring.filter((x) => x.id !== id); persist(); render(); toast('Recorrente excluída.'); } return; }
+    case 'toggle-rec': { const r = st.recurring.find((x) => x.id === id); r.active = !r.active; r.u = Date.now(); persist(); render(); return toast(r.active ? 'Recorrente ativada.' : 'Recorrente pausada.'); }
+    case 'del-rec': { const r = st.recurring.find((x) => x.id === id); if (confirm(`Excluir a recorrente “${r.name}”?\nO que já foi pago continua nos relatórios; as cobranças futuras somem.`)) { L.removeRec(st, 'recurring', id); persist(); render(); toast('Recorrente excluída.'); } return; }
     case 'toggle-cat': ui.open.has(id) ? ui.open.delete(id) : ui.open.add(id); return render();
     case 'edit-available': return editAvailable();
     case 'add-cat': return nameForm('Nova categoria', '', (n) => {
       const used = new Set(st.categories.map((c) => c.hue));
-      st.categories.push({ id: uid('c'), name: n, hue: HUES.find((h) => !used.has(h)) ?? Math.floor(Math.random() * 360), icon: 'tag' });
+      st.categories.push({ id: uid('c'), name: n, hue: HUES.find((h) => !used.has(h)) ?? Math.floor(Math.random() * 360), icon: 'tag', u: Date.now() });
       toast('Categoria criada.');
     });
-    case 'ren-cat': { const c = st.categories.find((x) => x.id === id); return nameForm('Renomear categoria', c.name, (n) => { c.name = n; }); }
+    case 'ren-cat': { const c = st.categories.find((x) => x.id === id); return nameForm('Renomear categoria', c.name, (n) => { c.name = n; c.u = Date.now(); }); }
     case 'del-cat': { const c = st.categories.find((x) => x.id === id); if (confirm(`Excluir a categoria “${c.name}”?\nO que era dela passa para “Outros”.`)) { L.deleteCategory(st, id); persist(); render(); toast('Categoria excluída.'); } return; }
+    case 'sync-now': return scheduleSync(0), toast('Sincronizando…');
+    case 'cloud-create': return cloudCreate();
+    case 'cloud-join': return cloudJoin();
+    case 'cloud-show': return showCode(store.getLink().code, false);
+    case 'cloud-unlink': if (confirm('Desligar a casa neste celular?\nOs dados continuam aqui, mas deixam de ser compartilhados. A casa na nuvem não é apagada.')) { store.setLink(null); sync.state = 'off'; renderSyncbar(); render(); toast('Desligado. Os dados ficaram neste celular.'); } return;
     case 'print': return window.print();
     case 'export': {
       const blob = new Blob([JSON.stringify(st, null, 2)], { type: 'application/json' });
@@ -355,7 +443,8 @@ document.addEventListener('click', (ev) => {
       return inp.click();
     }
     case 'reset-demo': if (confirm('Substituir tudo pelos dados de demonstração?')) { st = store.demo(); persist(); render(); toast('Demonstração restaurada.'); } return;
-    case 'reset-empty': if (confirm('Apagar TODOS os dados deste navegador e começar do zero?\nExporte uma cópia antes se quiser guardá-los.')) { st = store.fresh(); persist(); render(); toast('Tudo apagado.'); } return;
+    case 'reset-empty': if (store.getLink()) { if (confirm('Apagar TODOS os lançamentos da casa, nos dois celulares?\nIsso não dá para desfazer.')) { L.clearAll(st); persist(); render(); toast('Tudo apagado.'); } return; }
+      if (confirm('Apagar TODOS os dados deste navegador e começar do zero?\nExporte uma cópia antes se quiser guardá-los.')) { st = store.fresh(); persist(); render(); toast('Tudo apagado.'); } return;
   }
 });
 document.addEventListener('keydown', (e) => {
@@ -370,9 +459,28 @@ document.addEventListener('submit', (ev) => {
   const r = res === '' ? 0 : Number(res), a = av === '' ? 0 : parseSigned(av);
   if (!Number.isInteger(r) || r < 0 || r > 99) return toast('Número de moradores inválido.');
   if (Number.isNaN(a)) return toast('Valor disponível inválido.');
-  st.settings.residents = r; st.settings.available = a; persist(); toast('Configurações salvas.');
+  st.settings.residents = r; st.settings.u = Date.now(); if (a !== L.availableNow(st)) L.setAvailable(st, a); persist(); toast('Configurações salvas.');
 });
 $('#fab').addEventListener('click', () => expenseForm());
-window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden && $('#modal').hidden) render(); });
-render();
+window.addEventListener('hashchange', () => { if (st) render(); window.scrollTo(0, 0); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden && st && $('#modal').hidden) render(); });
+renderSyncbar();
+async function boot() {
+  if (!st) { // ligado à nuvem, mas sem cópia local: busca antes de mostrar qualquer tela
+    $('#fab').hidden = true;
+    $('#view').innerHTML = '<div class="card empty"><b>Carregando os dados da casa…</b></div>';
+    try {
+      const l = store.getLink();
+      const h = await cloud.fetchHouse(l.code);
+      st = h.state; store.save(st); store.setLink({ ...l, version: h.version, lastOk: Date.now() });
+    } catch (e) {
+      $('#view').innerHTML = `<div class="card empty"><h2 style="margin-bottom:8px">Não consegui carregar os dados da casa</h2><p>${esc(errText(e))}</p><p class="muted" style="margin-top:6px">Seus dados não foram apagados: eles estão no serviço online.</p><div class="btns" style="justify-content:center;margin-top:14px"><button class="btn" onclick="location.reload()">Tentar de novo</button></div></div>`;
+      return;
+    }
+  }
+  render();
+  if (store.getLink()) scheduleSync(100);
+}
+boot();
+document.addEventListener('visibilitychange', () => { if (!document.hidden && store.getLink()) scheduleSync(200); });
+setInterval(() => { if (!document.hidden && store.getLink()) scheduleSync(0); }, 30000);

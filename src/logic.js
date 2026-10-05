@@ -223,37 +223,63 @@ export function overview(st, today) {
   const n30 = upcoming(st, today, 30);
   const next7 = sumUnpaid(n7);
   const next30 = sumUnpaid(n30);
-  const available = st.settings.available || 0;
+  const available = availableNow(st);
   return { items7: n7, items30: n30, next7, next30, available, free: available - next7 };
 }
 
 // ---------- marcar como paga ----------
 /**
- * Pagar sai do dinheiro disponível (o dinheiro foi gasto); desfazer devolve o
- * mesmo valor. Assim "Livre depois das próximas contas" não sobe ao pagar.
- * `adjust: false` é só para montar a demonstração, que não mexe no saldo.
+ * "Disponível hoje" = valor que você informou (settings.available, definido em
+ * settings.availableSetAt) menos o que foi PAGO depois disso. Calculado assim
+ * (e não somando e subtraindo no próprio número), dois celulares pagando contas
+ * diferentes ao mesmo tempo não se atropelam, e desfazer devolve o valor sozinho.
  */
-export function markPaid(st, recId, date, now = new Date(), adjust = true) {
+export function availableNow(st) {
+  const since = st.settings.availableSetAt || 0;
+  let a = st.settings.available || 0;
+  for (const p of st.payments) if (Date.parse(p.paidAt) > since) a -= p.amount;
+  return a;
+}
+export function setAvailable(st, value, now = Date.now()) {
+  st.settings.available = value;
+  st.settings.availableSetAt = now;
+  st.settings.u = now;
+}
+
+export function markPaid(st, recId, date, now = new Date()) {
   const r = st.recurring.find((x) => x.id === recId);
   const key = payKey(recId, date);
   if (!r || st.payments.some((p) => p.key === key)) return;
-  st.payments.push({ key, recId, date, name: r.name, cat: r.cat, amount: r.amount, paidAt: now.toISOString() });
-  if (adjust) st.settings.available = (st.settings.available || 0) - r.amount;
+  st.payments.push({ key, recId, date, name: r.name, cat: r.cat, amount: r.amount, paidAt: now.toISOString(), u: now.getTime() });
 }
 export function unmarkPaid(st, recId, date) {
-  const key = payKey(recId, date);
-  const p = st.payments.find((x) => x.key === key);
-  if (!p) return;
-  st.payments = st.payments.filter((x) => x.key !== key);
-  st.settings.available = (st.settings.available || 0) + p.amount;
+  removeRec(st, 'payments', payKey(recId, date));
+}
+
+/** Exclui e deixa um "recibo de exclusão" (tombstone), para a exclusão chegar ao outro celular. */
+export function removeRec(st, coll, id) {
+  const isIt = coll === 'payments' ? (r) => r.key === id : (r) => r.id === id;
+  if (!st[coll].some(isIt)) return;
+  st[coll] = st[coll].filter((r) => !isIt(r));
+  st.del = st.del || {};
+  st.del[`${coll}:${id}`] = Date.now();
 }
 
 // ---------- categorias ----------
 export function deleteCategory(st, id) {
   if (id === 'outros') return false;
-  st.categories = st.categories.filter((c) => c.id !== id);
-  for (const e of st.expenses) if (e.cat === id) e.cat = 'outros';
-  for (const r of st.recurring) if (r.cat === id) r.cat = 'outros';
-  for (const p of st.payments) if (p.cat === id) p.cat = 'outros';
+  const t = Date.now();
+  removeRec(st, 'categories', id);
+  for (const e of st.expenses) if (e.cat === id) { e.cat = 'outros'; e.u = t; }
+  for (const r of st.recurring) if (r.cat === id) { r.cat = 'outros'; r.u = t; }
+  for (const p of st.payments) if (p.cat === id) { p.cat = 'outros'; p.u = t; }
   return true;
+}
+
+/** Apaga todos os lançamentos (mantém categorias e moradores), com recibos de exclusão. */
+export function clearAll(st) {
+  for (const c of ['expenses', 'recurring', 'payments']) {
+    for (const r of [...st[c]]) removeRec(st, c, c === 'payments' ? r.key : r.id);
+  }
+  setAvailable(st, 0);
 }

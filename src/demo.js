@@ -15,13 +15,14 @@ export const INITIAL_CATEGORIES = [
 ];
 
 export const emptyState = () => ({
-  v: 1,
+  v: 2,
   demo: false,
-  settings: { residents: 0, available: 0 },
-  categories: INITIAL_CATEGORIES.map((c) => ({ ...c })),
+  settings: { residents: 0, available: 0, availableSetAt: Date.now(), u: Date.now() },
+  categories: INITIAL_CATEGORIES.map((c) => ({ ...c, u: 0 })),
   expenses: [],
   recurring: [],
   payments: [],
+  del: {}, // recibos de exclusão: "coleção:id" -> quando foi excluído
 });
 
 // Data de "n meses atrás", mantendo o mesmo dia do mês (volta mais um mês se o dia não existir lá).
@@ -42,13 +43,13 @@ export const uid = (p = 'id') => `${p}${Date.now().toString(36)}${(seq++).toStri
 export function demoState(today) {
   const st = emptyState();
   st.demo = true;
-  st.settings = { residents: 7, available: 120000 };
+  st.settings = { residents: 7, available: 120000, availableSetAt: Date.now(), u: Date.now() };
   const { y, m } = parseISO(today);
   const nextFirst = m === 12 ? toISO(y + 1, 1, 1) : toISO(y, m + 1, 1);
   const rec = (id, name, cat, pounds, freq, due, account, back) => ({
     id, name, cat, amount: Math.round(pounds * 100), freq,
     start: back === 'year' ? toISO(parseISO(due).y - 1, parseISO(due).m, parseISO(due).d) : back === 'week' ? addDays(due, -7 * 12) : monthsBack(due, 3),
-    account, note: '', active: true,
+    account, note: '', active: true, u: 1,
   });
   st.recurring = [
     rec('r-aluguel', 'Aluguel', 'aluguel', 2300, 'monthly', nextFirst, 'Débito automático'),
@@ -61,11 +62,11 @@ export function demoState(today) {
   ];
   // Tudo que já venceu antes de hoje nasce pago, senão a demonstração começaria cheia de atrasadas.
   for (const r of st.recurring)
-    for (const d of occurrences(r, r.start, addDays(today, -1))) markPaid(st, r.id, d, new Date(d + 'T12:00:00'), false);
+    for (const d of occurrences(r, r.start, addDays(today, -1))) markPaid(st, r.id, d, new Date(d + 'T12:00:00'));
 
   const monthStart = toISO(y, m, 1);
   const back = (k) => { const d = addDays(today, -k); return d < monthStart ? monthStart : d; };
-  const ex = (k, desc, cat, pounds, note = '') => ({ id: uid('e'), date: back(k), desc, cat, amount: Math.round(pounds * 100), note });
+  const ex = (k, desc, cat, pounds, note = '') => ({ id: uid('e'), date: back(k), desc, cat, amount: Math.round(pounds * 100), note, u: 1 });
   st.expenses = [
     ex(4, 'Tesco', 'mercado', 450), ex(3, 'Aldi', 'mercado', 310),
     ex(2, 'Costco', 'mercado', 540), ex(1, 'Tesco', 'mercado', 500),
